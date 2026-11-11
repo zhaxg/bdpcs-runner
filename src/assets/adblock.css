@@ -1,0 +1,70 @@
+/* ============================================================
+ * 百度网盘清理规则（CSS）
+ *
+ * 说明：
+ *   - 这里的选择器会在主窗口和所有内嵌页面里通过 insertCSS 注入；
+ *   - 想恢复某条，删掉对应规则或整段注释即可；
+ *   - 改完后运行 start.bat（会重新生成 .patched 并同步本文件）。
+ *
+ * 下面的 class / id 来自 8.9.7 实际 DOM 与 renderer 源码。
+ * ============================================================ */
+
+/* 1. 顶部服务端广告位（id 形如 pc-header-ad-s-588） */
+[id^="pc-header-ad-"] { display: none !important; }
+
+/* 2. 顶部游戏入口 */
+.wp-header-game { display: none !important; }
+
+/* 3. 顶部「会员中心」按钮与周期引导（右侧容量保留） */
+.wp-disk-header__vip-btn,
+.vip-cycle-guide,
+.vip-cycle-guide__popper { display: none !important; }
+
+/* 4. 容量区里的「￥0.08/G起」价格（capacity-text 是已用/总容量，保留） */
+.header-capacity-info .price-text { display: none !important; }
+
+/* 5. 容量弹层里的「空间扩容」按钮 */
+.header-expand-capacity-btn { display: none !important; }
+
+/* 6. 账号切换弹层里的企业认证推广行 */
+.wp-header-user__switch-cert-tip { display: none !important; }
+
+/* 7. 搜索框的「智能推荐」下拉 */
+.smart-recommend-wrap { display: none !important; }
+
+/* 8. 文件列表里的推荐卡片 */
+.all-file-recommend-area,
+.recommend-card-transition-wrap { display: none !important; }
+
+/* 9. SVIP / 活动 / 会员卡弹窗 */
+.doc-save-svip-dialog,
+.wp-dialog-data-payguide,
+.ee-activity-wrap,
+.uip-membership-card,
+.uip-upgrade-btn-wrap,
+.u-svip-button { display: none !important; }
+
+/* 10. 功能引导浮层（快捷上传提示等） */
+.lead-tip-box,
+.mac-header-lead-tip { display: none !important; }
+
+/* 11. 头像上的 VIP 角标 */
+.uip-trigger-vip-badge-wrap { display: none !important; }
+
+/* 12. 头像下拉弹层里的运营位（瓜分百万天SVIP、领取网盘会员、游戏中心、会员中心等） */
+.uip-operations { display: none !important; }
+.uip-operation-item { display: none !important; }
+
+/* 12. 奖励任务/活动浮层（类名动态） */
+[class*="reward-task"],
+[class*="reward-popover"],
+[class*="goldCoin"] { display: none !important; }
+
+/* 保留几类旧规则的兜底（若新版本改了类名） */
+[class*="ad-guide"],
+[class*="ad-factory"],
+[class*="activity-conf"],
+[class*="ai-tool-banner"],
+[class*="svip-quota-banner"],
+[class*="privilege-guide"],
+[class*="video-payment-toast"] { display: none !important; }
