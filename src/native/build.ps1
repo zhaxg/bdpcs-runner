@@ -1,10 +1,10 @@
-# 重新编译 gate.dll / hook.dll（仅开发时需要）
-# 依赖：MinGW-w64（gcc 在 PATH 中，或位于 D:\env\MinGW-w64）
+# Rebuild gate.dll / hook.dll (development only)
+# Requires MinGW-w64 (gcc on PATH or in D:\env\MinGW-w64)
 $ErrorActionPreference = 'Stop'
 
 $gcc = (Get-Command gcc -ErrorAction SilentlyContinue).Source
 if (-not $gcc) { $gcc = 'D:\env\MinGW-w64\bin\gcc.exe' }
-if (-not (Test-Path $gcc)) { throw '找不到 gcc，请安装 MinGW-w64 或加入 PATH' }
+if (-not (Test-Path $gcc)) { throw 'Cannot find gcc; install MinGW-w64 or add it to PATH' }
 $here = $PSScriptRoot
 $assets = Join-Path (Split-Path $here -Parent) 'assets'
 

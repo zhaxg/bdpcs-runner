@@ -35,10 +35,12 @@ func (l *logger) Close() {
 }
 
 type config struct {
-	client string
-	status bool
-	restore bool
-	noKill bool
+	client     string
+	clientArgs []string
+	status     bool
+	restore    bool
+	install    bool
+	noKill     bool
 }
 
 func parseFlags() config {
@@ -51,6 +53,8 @@ func parseFlags() config {
 			c.status = true
 		case a == "--restore":
 			c.restore = true
+		case a == "--install":
+			c.install = true
 		case a == "--no-kill":
 			c.noKill = true
 		case a == "--client":
@@ -60,6 +64,10 @@ func parseFlags() config {
 			}
 		case strings.HasPrefix(a, "--client="):
 			c.client = strings.TrimPrefix(a, "--client=")
+		default:
+			if a != "" {
+				c.clientArgs = append(c.clientArgs, a)
+			}
 		}
 	}
 	return c
@@ -133,9 +141,8 @@ func ensurePatched(client string, log *logger) (string, string, error) {
 	patched := asar + ".patched"
 	metaPath := patched + ".meta"
 
-	css := mustAsset("adblock.css")
-	js := mustAsset("adblock.js")
-	rh := rulesHash(css, js)
+	js := mustAsset("BaiduNetdiskRunner.js")
+	rh := rulesHash(js)
 
 	src, err := os.ReadFile(asar)
 	if err != nil {
@@ -156,7 +163,7 @@ func ensurePatched(client string, log *logger) (string, string, error) {
 			old.RulesHash == meta.RulesHash && old.Tool == meta.Tool {
 			if pb, err := os.ReadFile(patched); err == nil {
 				if err := verifyPatched(pb); err == nil {
-					log.Printf("复用已生成的 .patched (%s, %s)", old.Version, describeRules(css, js))
+					log.Printf("复用已生成的 .patched (%s, %s)", old.Version, describeRules(js))
 					return patched, old.Version, nil
 				}
 				log.Printf("现有 .patched 校验失败，重新生成: %v", err)
@@ -164,7 +171,7 @@ func ensurePatched(client string, log *logger) (string, string, error) {
 		}
 	}
 
-	log.Printf("生成 core.asar.patched ... (%s)", describeRules(css, js))
+	log.Printf("生成 core.asar.patched ... (%s)", describeRules(js))
 	mainOld, err := readMainFromAsar(src)
 	if err != nil {
 		return "", "", fmt.Errorf("读取 main.js 失败: %w", err)
@@ -172,7 +179,7 @@ func ensurePatched(client string, log *logger) (string, string, error) {
 	if strings.Contains(string(mainOld), startMarker) {
 		return "", "", fmt.Errorf("原 core.asar 里已经存在注入标记，请先还原")
 	}
-	loader := buildLoader(css, js)
+	loader := buildLoader(js)
 	mainNew := insertLoader(mainOld, loader)
 	out, version, orig, err := buildPatched(src, mainNew)
 	if err != nil {
@@ -201,7 +208,7 @@ func ensurePatched(client string, log *logger) (string, string, error) {
 func waitStopped(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if len(runningProcesses("BaiduNetdisk.exe", "BaiduNetdiskUnite.exe", "baidunetdiskhost.exe")) == 0 {
+		if len(runningClientProcesses()) == 0 {
 			return true
 		}
 		time.Sleep(150 * time.Millisecond)
@@ -214,7 +221,8 @@ func doStatus(client, rt string, log *logger) {
 	patched := asar + ".patched"
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "客户端目录: %s\n", client)
-	fmt.Fprintf(&sb, "运行状态: %v\n\n", runningProcesses("BaiduNetdisk.exe", "BaiduNetdiskUnite.exe", "baidunetdiskhost.exe"))
+	fmt.Fprintf(&sb, "运行状态: %v\n", len(runningClientProcesses()) > 0)
+	fmt.Fprintf(&sb, "网页下载重定向: 启动 Runner 时自动注入\n\n")
 
 	if src, err := os.ReadFile(asar); err != nil {
 		fmt.Fprintf(&sb, "core.asar: 读取失败 %v\n", err)
@@ -233,10 +241,10 @@ func doStatus(client, rt string, log *logger) {
 	} else {
 		fmt.Fprintf(&sb, ".patched: 正常, %d B\n", len(pb))
 	}
-	css := mustAsset("adblock.css")
-	js := mustAsset("adblock.js")
-	fmt.Fprintf(&sb, "内置规则: %s\n", describeRules(css, js))
+	js := mustAsset("BaiduNetdiskRunner.js")
+	fmt.Fprintf(&sb, "内置规则: %s\n", describeRules(js))
 	fmt.Fprintf(&sb, "注入方式: 原生 DLL（MinHook，无 Frida）\n")
+	fmt.Fprintf(&sb, "开发者工具: 窗口内按 F12（或 Ctrl+Shift+I）切换\n")
 	fmt.Fprintf(&sb, "日志目录: %s\n\n", rt)
 	fmt.Fprintf(&sb, "--- main.log ---\n%s\n", lastLines(filepath.Join(rt, "main.log"), 30))
 	text := sb.String()
@@ -246,10 +254,13 @@ func doStatus(client, rt string, log *logger) {
 	messageBox("百度网盘清爽版 - 状态", text, false)
 }
 
-func doRestore(client, rt string, cfg config, log *logger) {
+func doRestore(client, rt string, cfg config, log *logger) error {
 	if !cfg.noKill {
 		n := killClient()
 		log.Printf("restore: 结束 %d 个进程", n)
+		if n := killYunDetect(); n > 0 {
+			log.Printf("restore: 结束 %d 个 YunDetectService", n)
+		}
 		waitStopped(6 * time.Second)
 	}
 	res := filepath.Join(client, "Module", "BrowserEngine", "resources")
@@ -261,14 +272,16 @@ func doRestore(client, rt string, cfg config, log *logger) {
 		}
 	}
 	os.RemoveAll(filepath.Join(client, "Module", "BrowserEngine", "adblock"))
+	os.Remove(filepath.Join(rt, "client.pid"))
 	log.Printf("restore: 删除 %d 个文件", removed)
 	messageBox("百度网盘清爽版 - 还原",
 		"已停止客户端并删除注入文件。\n原 core.asar 没有被修改，直接启动客户端即可。", false)
+	return nil
 }
 
 func fail(log *logger, format string, a ...any) {
 	msg := fmt.Sprintf(format, a...)
-	log.Printf("ERROR " + msg)
+	log.Printf("ERROR %s", msg)
 	messageBox("百度网盘清爽版 - 错误", msg+"\n\n日志: "+filepath.Join(runtimeDir(), "main.log"), true)
 	os.Exit(1)
 }
@@ -290,12 +303,31 @@ func main() {
 		if !validClient(client) {
 			fail(log, "找不到客户端: %s", client)
 		}
-		doRestore(client, rt, cfg, log)
+		if err := doRestore(client, rt, cfg, log); err != nil {
+			fail(log, "%v", err)
+		}
 		return
 	}
 
 	if !validClient(client) {
 		fail(log, "找不到客户端: %s\n请把 BaiduNetdiskRunner.exe 放到 BaiduNetdisk.exe 同目录，或用 --client 指定", client)
+	}
+	if cfg.install {
+		r, err := prepareRuntime(client, rt, log)
+		if err != nil {
+			fail(log, "%v", err)
+		}
+		r.installYDGate(log)
+		messageBox("百度网盘清爽版 - 网页下载重定向",
+			"已尝试注入当前 YunDetectService。\n以后启动 Runner 时也会自动刷新；若网页仍拉起原版，请先启动一次 Runner。", false)
+		return
+	}
+	if len(cfg.clientArgs) > 0 && injectedClientRunning() {
+		if err := forwardClientArgs(client, cfg.clientArgs, log); err != nil {
+			fail(log, "%v", err)
+		}
+		log.Printf("已将下载参数转发给已运行的客户端")
+		return
 	}
 	if !singleInstance() {
 		fail(log, "已有一个 NetdiskClean 正在运行")
@@ -308,7 +340,7 @@ func main() {
 		if !waitStopped(8 * time.Second) {
 			fail(log, "客户端进程未能完全退出，请手动退出后重试")
 		}
-	} else if len(runningProcesses("BaiduNetdisk.exe", "BaiduNetdiskUnite.exe")) > 0 {
+	} else if len(runningClientProcesses()) > 0 {
 		fail(log, "客户端正在运行（--no-kill）。请先退出客户端")
 	}
 
@@ -322,7 +354,8 @@ func main() {
 	if err != nil {
 		fail(log, "%v", err)
 	}
-	if err := r.start(); err != nil {
+	r.installYDGate(log)
+	if err := r.start(cfg.clientArgs); err != nil {
 		fail(log, "%v", err)
 	}
 	log.Printf("完成")

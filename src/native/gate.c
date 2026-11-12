@@ -1,8 +1,9 @@
 /*
- * gate.dll —— 注入到外层 BaiduNetdisk.exe（VMProtect 加壳）。
- * 用 MinHook 挂 kernel32!CreateProcessW（和 Frida 的做法一致，不改 VMProtect
- * 保护的导入表）。外层创建 BaiduNetdiskUnite.exe 后，再 SuspendThread 4 次
- * 把子线程挂住，把 PID 写到 %NDC_GATE_FILE%，由启动器注入 hook.dll 后恢复。
+ * gate.dll has two modes:
+ * - injected into outer BaiduNetdisk.exe: pause BaiduNetdiskUnite.exe and
+ *   publish its PID through %NDC_GATE_FILE% for hook.dll injection;
+ * - injected into YunDetectService.exe: redirect CreateProcessW for
+ *   BaiduNetdisk.exe to BaiduNetdiskRunner.exe with the same arguments.
  */
 #include <windows.h>
 #include <wchar.h>
@@ -16,6 +17,9 @@ typedef BOOL (WINAPI *CreateProcessW_t)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
 static CreateProcessW_t real_CreateProcessW;
 static WCHAR g_dir[MAX_PATH * 2];
 static WCHAR g_gate_file[MAX_PATH * 2];
+static WCHAR g_runner[MAX_PATH * 2];
+static int g_yd_mode;
+static HANDLE g_gate_mutex;
 
 static void read_env(void)
 {
@@ -24,6 +28,14 @@ static void read_env(void)
     if (n == 0 || n >= MAX_PATH * 2) g_dir[0] = 0;
     n = GetEnvironmentVariableW(L"NDC_GATE_FILE", g_gate_file, MAX_PATH * 2);
     if (n == 0 || n >= MAX_PATH * 2) g_gate_file[0] = 0;
+    if (!g_dir[0]) {
+        n = GetEnvironmentVariableW(L"LOCALAPPDATA", g_dir, MAX_PATH * 2);
+        if (n > 0 && n < MAX_PATH * 2) {
+            wcscat(g_dir, L"\\BaiduNetdiskClean");
+        } else {
+            g_dir[0] = 0;
+        }
+    }
 }
 
 static void append_utf8(const WCHAR *path, const WCHAR *text)
@@ -75,6 +87,66 @@ static int contains_i(const WCHAR *hay, const WCHAR *needle)
     return 0;
 }
 
+static const WCHAR *base_name(const WCHAR *path)
+{
+    const WCHAR *base = path;
+    const WCHAR *p;
+    if (!path) return L"";
+    for (p = path; *p; ++p) {
+        if (*p == L'\\' || *p == L'/') base = p + 1;
+    }
+    return base;
+}
+
+static int equals_i(const WCHAR *a, const WCHAR *b)
+{
+    size_t i;
+    if (!a || !b) return 0;
+    for (i = 0; a[i] && b[i]; ++i) {
+        if (towlower(a[i]) != towlower(b[i])) return 0;
+    }
+    return a[i] == 0 && b[i] == 0;
+}
+
+static int is_client_exe(const WCHAR *path)
+{
+    return equals_i(base_name(path), L"BaiduNetdisk.exe");
+}
+
+static int command_is_client(const WCHAR *cmd)
+{
+    WCHAR first[MAX_PATH * 2];
+    const WCHAR *p = cmd;
+    size_t i = 0;
+    if (!cmd) return 0;
+    while (*p == L' ' || *p == L'\t') ++p;
+    if (*p == L'"') {
+        ++p;
+        while (*p && *p != L'"' && i + 1 < MAX_PATH * 2) first[i++] = *p++;
+    } else {
+        while (*p && *p != L' ' && *p != L'\t' && i + 1 < MAX_PATH * 2) {
+            first[i++] = *p++;
+        }
+    }
+    first[i] = 0;
+    return is_client_exe(first);
+}
+
+static void build_yd_command(const WCHAR *cmd, WCHAR *out, size_t out_len)
+{
+    const WCHAR *tail = L"";
+    if (cmd && cmd[0]) {
+        if (cmd[0] == L'"') {
+            const WCHAR *q = wcschr(cmd + 1, L'"');
+            if (q) tail = q + 1;
+        } else {
+            const WCHAR *sp = wcschr(cmd, L' ');
+            tail = sp ? sp : cmd + wcslen(cmd);
+        }
+    }
+    swprintf(out, out_len, L"\"%ls\"%ls", g_runner, tail);
+}
+
 static BOOL WINAPI HookCreateProcessW(LPCWSTR app, LPWSTR cmd,
     LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta, BOOL inherit,
     DWORD flags, LPVOID env, LPCWSTR cwd, LPSTARTUPINFOW si,
@@ -90,6 +162,19 @@ static BOOL WINAPI HookCreateProcessW(LPCWSTR app, LPWSTR cmd,
     if (cmd) wcsncpy(cmdbuf, cmd, 199);
     appbuf[159] = 0;
     cmdbuf[199] = 0;
+
+    if (g_yd_mode && (is_client_exe(app) || command_is_client(cmd))) {
+        WCHAR newcmd[32768];
+        WCHAR msg[512];
+        build_yd_command(cmd, newcmd, 32768);
+        ok = real_CreateProcessW(g_runner, newcmd, pa, ta, inherit, flags,
+                                 env, cwd, si, pi);
+        swprintf(msg, 512,
+                 L"YD REDIRECT ok=%d app=%.100ls cmd=%.140ls",
+                 ok, appbuf, cmdbuf);
+        log_event(msg);
+        return ok;
+    }
 
     ok = real_CreateProcessW(app, cmd, pa, ta, inherit, flags, env, cwd,
                              si, pi);
@@ -129,10 +214,31 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
         HMODULE k32;
         void *target;
         MH_STATUS st;
+        WCHAR selfPath[MAX_PATH * 2];
+        WCHAR *slash;
         WCHAR msg[256];
 
         DisableThreadLibraryCalls(self);
+        selfPath[0] = 0;
+        GetModuleFileNameW(NULL, selfPath, MAX_PATH * 2);
+        g_yd_mode = equals_i(base_name(selfPath), L"YunDetectService.exe");
         read_env();
+        swprintf(msg, 256, L"Local\\BaiduNetdiskClean_Gate_%ls",
+                 g_yd_mode ? L"YD" : L"Client");
+        g_gate_mutex = CreateMutexW(NULL, FALSE, msg);
+        if (g_gate_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+            log_event(L"gate already active, skip duplicate install");
+            CloseHandle(g_gate_mutex);
+            g_gate_mutex = NULL;
+            return TRUE;
+        }
+        wcscpy(g_runner, selfPath);
+        slash = wcsrchr(g_runner, L'\\');
+        if (slash) {
+            wcscpy(slash + 1, L"BaiduNetdiskRunner.exe");
+        } else {
+            wcscpy(g_runner, L"BaiduNetdiskRunner.exe");
+        }
 
         st = MH_Initialize();
         k32 = GetModuleHandleW(L"kernel32.dll");
@@ -142,8 +248,8 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
                                (void **)&real_CreateProcessW);
             if (st == MH_OK) st = MH_EnableHook(target);
         }
-        swprintf(msg, 256, L"gate installed, hook status=%d target=%p", st,
-                 target);
+        swprintf(msg, 256, L"gate installed mode=%ls hook status=%d target=%p",
+                 g_yd_mode ? L"yundetect" : L"client", st, target);
         log_event(msg);
     }
     return TRUE;

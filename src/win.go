@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -14,19 +17,19 @@ const (
 )
 
 var (
-	k32        = syscall.NewLazyDLL("kernel32.dll")
-	user32     = syscall.NewLazyDLL("user32.dll")
-	pSnap      = k32.NewProc("CreateToolhelp32Snapshot")
-	pProcFirst = k32.NewProc("Process32FirstW")
-	pProcNext  = k32.NewProc("Process32NextW")
-	pThrFirst  = k32.NewProc("Thread32First")
-	pThrNext   = k32.NewProc("Thread32Next")
-	pOpenProc  = k32.NewProc("OpenProcess")
-	pTermProc  = k32.NewProc("TerminateProcess")
-	pOpenThr   = k32.NewProc("OpenThread")
-	pResumeThr = k32.NewProc("ResumeThread")
+	k32         = syscall.NewLazyDLL("kernel32.dll")
+	user32      = syscall.NewLazyDLL("user32.dll")
+	pSnap       = k32.NewProc("CreateToolhelp32Snapshot")
+	pProcFirst  = k32.NewProc("Process32FirstW")
+	pProcNext   = k32.NewProc("Process32NextW")
+	pThrFirst   = k32.NewProc("Thread32First")
+	pThrNext    = k32.NewProc("Thread32Next")
+	pOpenProc   = k32.NewProc("OpenProcess")
+	pTermProc   = k32.NewProc("TerminateProcess")
+	pOpenThr    = k32.NewProc("OpenThread")
+	pResumeThr  = k32.NewProc("ResumeThread")
 	pSuspendThr = k32.NewProc("SuspendThread")
-	pClose     = k32.NewProc("CloseHandle")
+	pClose      = k32.NewProc("CloseHandle")
 	pMessageBox = user32.NewProc("MessageBoxW")
 )
 
@@ -85,6 +88,26 @@ func runningProcesses(names ...string) map[uint32]string {
 	return out
 }
 
+func runningClientProcesses() map[uint32]string {
+	out := runningProcesses("BaiduNetdisk.exe",
+		"BaiduNetdiskUnite.exe", "baidunetdiskhost.exe")
+	delete(out, uint32(os.Getpid()))
+	return out
+}
+
+func injectedClientRunning() bool {
+	b, err := os.ReadFile(filepath.Join(runtimeDir(), "client.pid"))
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	_, ok := runningProcesses("BaiduNetdisk.exe")[uint32(pid)]
+	return ok
+}
+
 func uniteSet() map[uint32]bool {
 	out := map[uint32]bool{}
 	for _, pe := range processList() {
@@ -97,14 +120,34 @@ func uniteSet() map[uint32]bool {
 
 func killClient() int {
 	targets := map[string]bool{
-		"baidunetdisk.exe":       true,
-		"baidunetdiskunite.exe":  true,
-		"baidunetdiskhost.exe":   true,
+		"baidunetdisk.exe":      true,
+		"baidunetdiskunite.exe": true,
+		"baidunetdiskhost.exe":  true,
 	}
 	n := 0
+	self := uint32(os.Getpid())
 	for _, pe := range processList() {
+		if pe.ProcessID == self {
+			continue
+		}
 		name := strings.ToLower(syscall.UTF16ToString(pe.ExeFile[:]))
 		if !targets[name] {
+			continue
+		}
+		h, _, _ := pOpenProc.Call(processTerminate, 0, uintptr(pe.ProcessID))
+		if h != 0 {
+			pTermProc.Call(h, 1)
+			pClose.Call(h)
+			n++
+		}
+	}
+	return n
+}
+
+func killYunDetect() int {
+	n := 0
+	for _, pe := range processList() {
+		if !strings.EqualFold(syscall.UTF16ToString(pe.ExeFile[:]), "YunDetectService.exe") {
 			continue
 		}
 		h, _, _ := pOpenProc.Call(processTerminate, 0, uintptr(pe.ProcessID))

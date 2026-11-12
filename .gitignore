@@ -1,8 +1,12 @@
-# 构建产物
-*.exe
+# 构建中间产物
 *.dll
 *.syso
 *.log
+
+# 发布产物：允许直接在 GitHub 下载
+/dist/*
+!/dist/BaiduNetdiskRunner.exe
+!/dist/BaiduNetdiskRunner.js
 
 # 本地备份（客户端原包与旧版程序）
 /backup/

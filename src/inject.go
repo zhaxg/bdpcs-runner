@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,25 +14,25 @@ import (
 )
 
 type runner struct {
-	clientDir string
+	clientDir  string
 	runtimeDir string
-	gateDLL   string
-	hookDLL   string
-	gateFile  string
-	log       *logger
+	gateDLL    string
+	hookDLL    string
+	gateFile   string
+	log        *logger
 }
 
 const (
-	procCreateThread   = 0x0002
-	procQueryInfo      = 0x0400
-	procVMOperation    = 0x0008
-	procVMWrite        = 0x0020
-	procVMRead         = 0x0010
-	memCommitReserve   = 0x00003000
-	memRelease         = 0x00008000
-	pageReadWrite      = 0x04
-	createSuspended    = 0x00000004
-	waitTimeout        = 0x00000102
+	procCreateThread = 0x0002
+	procQueryInfo    = 0x0400
+	procVMOperation  = 0x0008
+	procVMWrite      = 0x0020
+	procVMRead       = 0x0010
+	memCommitReserve = 0x00003000
+	memRelease       = 0x00008000
+	pageReadWrite    = 0x04
+	createSuspended  = 0x00000004
+	waitTimeout      = 0x00000102
 )
 
 var (
@@ -105,13 +106,18 @@ func lastLines(path string, n int) string {
 	return strings.Join(lines[start:], "\n")
 }
 
-func spawnSuspended(exe, dir string) (syscall.ProcessInformation, error) {
+func spawnSuspended(exe, dir string, args []string) (syscall.ProcessInformation, error) {
 	var pi syscall.ProcessInformation
 	app, err := syscall.UTF16PtrFromString(exe)
 	if err != nil {
 		return pi, err
 	}
-	cmd := syscall.StringToUTF16(`"` + exe + `"`)
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, syscall.EscapeArg(exe))
+	for _, arg := range args {
+		parts = append(parts, syscall.EscapeArg(arg))
+	}
+	cmd := syscall.StringToUTF16(strings.Join(parts, " "))
 	cwd, err := syscall.UTF16PtrFromString(dir)
 	if err != nil {
 		return pi, err
@@ -190,23 +196,31 @@ func (r *runner) terminate(pi syscall.ProcessInformation) {
 	}
 }
 
-func (r *runner) start() error {
+func (r *runner) start(args []string) error {
 	adLog := filepath.Join(r.runtimeDir, "adblock.log")
+	clientPid := filepath.Join(r.runtimeDir, "client.pid")
 	os.Remove(adLog)
+	os.Remove(clientPid)
 	os.Remove(filepath.Join(r.runtimeDir, "gate-events.log"))
 	os.Remove(filepath.Join(r.runtimeDir, "hook-events.log"))
 	os.Remove(r.gateFile)
 
-	if len(uniteSet()) != 0 || len(runningProcesses("BaiduNetdisk.exe")) != 0 {
+	if len(uniteSet()) != 0 || len(runningClientProcesses()) != 0 {
 		return errors.New("仍有客户端进程在运行")
 	}
 
 	os.Setenv("NDC_DIR", r.runtimeDir)
 	os.Setenv("NDC_GATE_FILE", r.gateFile)
+	if exe, err := os.Executable(); err == nil {
+		os.Setenv("NDC_JS", filepath.Join(filepath.Dir(exe), "BaiduNetdiskRunner.js"))
+	}
 
 	outer := filepath.Join(r.clientDir, "BaiduNetdisk.exe")
-	r.log.Printf("以挂起方式创建外层客户端 ...")
-	pi, err := spawnSuspended(outer, r.clientDir)
+	if _, err := os.Stat(outer); err != nil {
+		return fmt.Errorf("找不到原版客户端入口 %s: %w", filepath.Base(outer), err)
+	}
+	r.log.Printf("以挂起方式创建外层客户端: %s args=%d", filepath.Base(outer), len(args))
+	pi, err := spawnSuspended(outer, r.clientDir, args)
 	if err != nil {
 		return fmt.Errorf("创建外层进程失败: %w", err)
 	}
@@ -266,6 +280,7 @@ func (r *runner) start() error {
 	for time.Now().Before(deadline) {
 		if b, err := os.ReadFile(adLog); err == nil &&
 			strings.Contains(string(b), "loader ready") {
+			os.WriteFile(clientPid, []byte(strconv.Itoa(int(pi.ProcessId))), 0644)
 			r.log.Printf("客户端已加载去广告规则: %s",
 				strings.TrimSpace(string(b)))
 			return nil
@@ -275,11 +290,44 @@ func (r *runner) start() error {
 	return errors.New("客户端已启动，但 20 秒内没有看到 loader ready；请查看 " + adLog)
 }
 
+func (r *runner) installYDGate(log *logger) {
+	pids := runningProcesses("YunDetectService.exe")
+	if len(pids) == 0 {
+		exe := filepath.Join(r.clientDir, "YunDetectService.exe")
+		if _, err := os.Stat(exe); err == nil {
+			cmd := exec.Command(exe)
+			cmd.Dir = r.clientDir
+			if err := cmd.Start(); err != nil {
+				log.Printf("启动 YunDetectService 失败: %v", err)
+				return
+			}
+			log.Printf("已启动 YunDetectService，等待注入 ...")
+			for i := 0; i < 30 && len(pids) == 0; i++ {
+				time.Sleep(100 * time.Millisecond)
+				pids = runningProcesses("YunDetectService.exe")
+			}
+		}
+	}
+	if len(pids) == 0 {
+		log.Printf("YunDetectService 未运行，跳过网页下载重定向")
+		return
+	}
+	for pid := range pids {
+		if pid == uint32(os.Getpid()) {
+			continue
+		}
+		if err := injectDLL(pid, r.gateDLL, 10*time.Second); err != nil {
+			log.Printf("网页下载重定向注入 pid=%d 失败: %v", pid, err)
+		} else {
+			log.Printf("网页下载重定向已注入 pid=%d", pid)
+		}
+	}
+}
+
 func (r *runner) waitStopped(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if len(runningProcesses("BaiduNetdisk.exe", "BaiduNetdiskUnite.exe",
-			"baidunetdiskhost.exe")) == 0 {
+		if len(runningClientProcesses()) == 0 {
 			return true
 		}
 		time.Sleep(150 * time.Millisecond)
